@@ -21,6 +21,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -35,6 +36,7 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import com.dangtuan.btranslate.BuildConfig
 import com.dangtuan.btranslate.R
 import com.dangtuan.btranslate.auth.AccountApi
 import com.dangtuan.btranslate.auth.TokenStore
@@ -44,6 +46,8 @@ import com.dangtuan.btranslate.translation.ScreenCaptureController
 import com.dangtuan.btranslate.translation.TranslatedLine
 import com.dangtuan.btranslate.translation.TranslationEngine
 import com.dangtuan.btranslate.ui.MainActivity
+import com.dangtuan.btranslate.update.UpdateChecker
+import com.dangtuan.btranslate.update.UpdateInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -70,11 +74,14 @@ class OverlayService : Service() {
     private val accountApi = AccountApi()
     private lateinit var tokenStore: TokenStore
     private val translator = TranslationEngine()
+    private val updateChecker = UpdateChecker()
     private var authenticated = false
     private var checkingSession = false
     private var continuous = false
     private var continuousJob: Job? = null
     private var translating = false
+    private var latestUpdate: UpdateInfo? = null
+    private var updateChecked = false
     private var source = LanguageCatalog.sources.first()
     private var target = LanguageCatalog.targets.first { it.code == "vi" }
 
@@ -171,13 +178,17 @@ class OverlayService : Service() {
         private var startX = 0
         private var startY = 0
         private var moved = false
-        private var pendingSingleTap = false
-        private var secondTapCandidate = false
-        private var lastTapUpTime = 0L
-        private val doubleTapTimeout = android.view.ViewConfiguration.getDoubleTapTimeout().toLong()
-        private val singleTap = Runnable {
-            pendingSingleTap = false
-            openPanel()
+        private var longPressTriggered = false
+        private val longPress = Runnable {
+            if (!moved) {
+                longPressTriggered = true
+                if (panel == null) {
+                    removeTranslationLayer()
+                    openPanel()
+                } else {
+                    closePanel()
+                }
+            }
         }
 
         override fun onTouch(view: View, event: MotionEvent): Boolean {
@@ -188,12 +199,8 @@ class OverlayService : Service() {
                     downX = event.rawX; downY = event.rawY
                     startX = bubbleParams.x; startY = bubbleParams.y
                     moved = false
-                    val now = android.os.SystemClock.uptimeMillis()
-                    secondTapCandidate = pendingSingleTap && now - lastTapUpTime <= doubleTapTimeout
-                    if (secondTapCandidate) {
-                        handler.removeCallbacks(singleTap)
-                        pendingSingleTap = false
-                    }
+                    longPressTriggered = false
+                    handler.postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
                     return true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -201,6 +208,7 @@ class OverlayService : Service() {
                     val dy = event.rawY - downY
                     if (abs(dx) > dp(8) || abs(dy) > dp(8)) {
                         moved = true
+                        handler.removeCallbacks(longPress)
                         val (w, h) = screenSize()
                         bubbleParams.x = (startX + dx.toInt()).coerceIn(0, max(0, w - bubble.width))
                         bubbleParams.y = (startY + dy.toInt()).coerceIn(0, max(0, h - bubble.height))
@@ -209,25 +217,15 @@ class OverlayService : Service() {
                     return true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    handler.removeCallbacks(longPress)
                     bubble.text = "B"
                     if (moved) {
                         snapBubbleToEdge()
-                    } else if (event.actionMasked == MotionEvent.ACTION_UP) {
-                        if (secondTapCandidate) {
-                            if (authenticated) {
-                                closePanel()
-                                bubble.text = "…"
-                                translateOnce()
-                            } else if (panel == null) {
-                                showAuthPanel()
-                            }
-                        } else {
-                            lastTapUpTime = android.os.SystemClock.uptimeMillis()
-                            pendingSingleTap = true
-                            handler.postDelayed(singleTap, doubleTapTimeout)
-                        }
+                    } else if (event.actionMasked == MotionEvent.ACTION_UP && !longPressTriggered) {
+                        closePanel()
+                        bubble.text = "…"
+                        translateOnce()
                     }
-                    secondTapCandidate = false
                     scheduleFade()
                     return true
                 }
@@ -333,12 +331,64 @@ class OverlayService : Service() {
         root.addView(targetSpinner)
         root.addView(continuousSwitch, margins(top = 10))
         root.addView(TextView(this).apply {
-            text = "Bật: tự động dịch liên tục.\nTắt: nhấp đúp nút B để dịch một lần."
+            text = "Chạm B: dịch một lần.\nGiữ B: mở hoặc đóng bảng.\nGiữ rồi kéo: di chuyển nút B."
             textSize = 13f; setTextColor(Color.DKGRAY)
         }, margins(top = 4))
+        val updateStatus = TextView(this).apply {
+            text = "Phiên bản hiện tại: ${BuildConfig.VERSION_NAME}"
+            textSize = 13f; setTextColor(Color.DKGRAY)
+        }
+        val updateButton = Button(this).apply {
+            text = latestUpdate?.let { "Cập nhật lên ${it.versionName}" } ?: "Kiểm tra cập nhật"
+            setOnClickListener {
+                latestUpdate?.let(::startUpdate) ?: checkForUpdate(this, updateStatus, showCurrentToast = true)
+            }
+        }
+        root.addView(updateStatus, margins(top = 12))
+        root.addView(updateButton, margins(top = 4))
         root.addView(closePanelButton(), margins(top = 12))
         root.addView(exitButton(), margins(top = 12))
         showPanel(root)
+        if (!updateChecked) checkForUpdate(updateButton, updateStatus, showCurrentToast = false)
+    }
+
+    private fun checkForUpdate(button: Button, status: TextView, showCurrentToast: Boolean) {
+        button.isEnabled = false
+        button.text = "Đang kiểm tra…"
+        serviceScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { updateChecker.check() }
+                updateChecked = true
+                latestUpdate = result
+                if (!button.isAttachedToWindow) return@launch
+                button.isEnabled = true
+                if (result == null) {
+                    button.text = "Kiểm tra cập nhật"
+                    status.text = "Phiên bản ${BuildConfig.VERSION_NAME} đang là bản mới nhất."
+                    if (showCurrentToast) toast("Bạn đang dùng bản mới nhất.")
+                } else {
+                    button.text = "Cập nhật lên ${result.versionName}"
+                    status.text = result.notes.ifBlank { "Đã có phiên bản ${result.versionName}." }
+                }
+            } catch (error: Exception) {
+                if (!button.isAttachedToWindow) return@launch
+                button.isEnabled = true
+                button.text = "Thử kiểm tra lại"
+                status.text = "Chưa kiểm tra được cập nhật."
+                if (showCurrentToast) toast(error.message ?: "Lỗi kiểm tra cập nhật")
+            }
+        }
+    }
+
+    private fun startUpdate(info: UpdateInfo) {
+        closePanel()
+        startActivity(Intent(this, MainActivity::class.java).apply {
+            action = MainActivity.ACTION_INSTALL_UPDATE
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            putExtra(MainActivity.EXTRA_APK_URL, info.apkUrl)
+            putExtra(MainActivity.EXTRA_VERSION_NAME, info.versionName)
+            putExtra(MainActivity.EXTRA_SHA256, info.sha256)
+        })
     }
 
     private fun validateSavedSession() {
@@ -418,8 +468,8 @@ class OverlayService : Service() {
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
         val (screenW, screenH) = screenSize()
@@ -442,8 +492,16 @@ class OverlayService : Service() {
                 min(screenW - box.left, max(box.width(), dp(40))), WindowManager.LayoutParams.WRAP_CONTENT
             ).apply { leftMargin = box.left; topMargin = box.top })
         }
+        layer.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) removeTranslationLayer()
+            true
+        }
         windows.addView(layer, params)
         translationLayer = layer
+        runCatching {
+            windows.removeView(bubble)
+            windows.addView(bubble, bubbleParams)
+        }
     }
 
     private fun removeTranslationLayer() {
