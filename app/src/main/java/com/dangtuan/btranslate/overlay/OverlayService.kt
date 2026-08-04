@@ -1,0 +1,549 @@
+package com.dangtuan.btranslate.overlay
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.provider.Settings
+import android.util.DisplayMetrics
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Button
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.ScrollView
+import android.widget.Spinner
+import android.widget.Switch
+import android.widget.TextView
+import android.widget.Toast
+import androidx.core.app.NotificationCompat
+import com.dangtuan.btranslate.R
+import com.dangtuan.btranslate.auth.AccountApi
+import com.dangtuan.btranslate.auth.TokenStore
+import com.dangtuan.btranslate.translation.LanguageCatalog
+import com.dangtuan.btranslate.translation.LanguageOption
+import com.dangtuan.btranslate.translation.ScreenCaptureController
+import com.dangtuan.btranslate.translation.TranslatedLine
+import com.dangtuan.btranslate.translation.TranslationEngine
+import com.dangtuan.btranslate.ui.MainActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+@Suppress("DEPRECATION")
+class OverlayService : Service() {
+    private lateinit var windows: WindowManager
+    private lateinit var bubble: TextView
+    private lateinit var bubbleParams: WindowManager.LayoutParams
+    private var panel: View? = null
+    private var translationLayer: FrameLayout? = null
+    private var captureController: ScreenCaptureController? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val handler = Handler(Looper.getMainLooper())
+    private val accountApi = AccountApi()
+    private lateinit var tokenStore: TokenStore
+    private val translator = TranslationEngine()
+    private var authenticated = false
+    private var checkingSession = false
+    private var continuous = false
+    private var continuousJob: Job? = null
+    private var translating = false
+    private var source = LanguageCatalog.sources.first()
+    private var target = LanguageCatalog.targets.first { it.code == "vi" }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification())
+        }
+        windows = getSystemService(WindowManager::class.java)
+        tokenStore = TokenStore(this)
+        if (!Settings.canDrawOverlays(this)) {
+            stopSelf()
+            return
+        }
+        showBubble()
+        validateSavedSession()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> stopSelf()
+            ACTION_START_CAPTURE -> {
+                val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                    else @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+                if (data != null) startCapture(resultCode, data)
+            }
+            ACTION_SHOW, null -> if (!::bubble.isInitialized && Settings.canDrawOverlays(this)) showBubble()
+        }
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val (w, h) = screenSize()
+        captureController?.resize(w, h)
+        if (::bubbleParams.isInitialized) {
+            bubbleParams.x = bubbleParams.x.coerceIn(0, max(0, w - dp(58)))
+            bubbleParams.y = bubbleParams.y.coerceIn(0, max(0, h - dp(58)))
+            runCatching { windows.updateViewLayout(bubble, bubbleParams) }
+        }
+        removeTranslationLayer()
+        panel?.let {
+            closePanel()
+            if (authenticated) showControlPanel() else showAuthPanel()
+        }
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        continuousJob?.cancel()
+        captureController?.close()
+        captureController = null
+        closePanel()
+        removeTranslationLayer()
+        if (::bubble.isInitialized) runCatching { windows.removeView(bubble) }
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    private fun showBubble() {
+        if (::bubble.isInitialized) return
+        bubble = TextView(this).apply {
+            text = "B"
+            textSize = 25f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            elevation = dp(8).toFloat()
+            background = rounded(Color.rgb(43, 103, 246), dp(29).toFloat())
+            setOnTouchListener(BubbleTouch())
+        }
+        val prefs = getSharedPreferences("overlay", MODE_PRIVATE)
+        bubbleParams = WindowManager.LayoutParams(
+            dp(58), dp(58), WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = prefs.getInt("bubble_x", dp(12))
+            y = prefs.getInt("bubble_y", dp(160))
+        }
+        windows.addView(bubble, bubbleParams)
+        scheduleFade()
+    }
+
+    private inner class BubbleTouch : View.OnTouchListener {
+        private var downX = 0f
+        private var downY = 0f
+        private var startX = 0
+        private var startY = 0
+        private var moved = false
+        private var pendingSingleTap = false
+        private var secondTapCandidate = false
+        private var lastTapUpTime = 0L
+        private val doubleTapTimeout = android.view.ViewConfiguration.getDoubleTapTimeout().toLong()
+        private val singleTap = Runnable {
+            pendingSingleTap = false
+            openPanel()
+        }
+
+        override fun onTouch(view: View, event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    handler.removeCallbacksAndMessages(FADE_TOKEN)
+                    bubble.alpha = 1f
+                    downX = event.rawX; downY = event.rawY
+                    startX = bubbleParams.x; startY = bubbleParams.y
+                    moved = false
+                    val now = android.os.SystemClock.uptimeMillis()
+                    secondTapCandidate = pendingSingleTap && now - lastTapUpTime <= doubleTapTimeout
+                    if (secondTapCandidate) {
+                        handler.removeCallbacks(singleTap)
+                        pendingSingleTap = false
+                    }
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - downX
+                    val dy = event.rawY - downY
+                    if (abs(dx) > dp(8) || abs(dy) > dp(8)) {
+                        moved = true
+                        val (w, h) = screenSize()
+                        bubbleParams.x = (startX + dx.toInt()).coerceIn(0, max(0, w - bubble.width))
+                        bubbleParams.y = (startY + dy.toInt()).coerceIn(0, max(0, h - bubble.height))
+                        windows.updateViewLayout(bubble, bubbleParams)
+                    }
+                    return true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    bubble.text = "B"
+                    if (moved) {
+                        snapBubbleToEdge()
+                    } else if (event.actionMasked == MotionEvent.ACTION_UP) {
+                        if (secondTapCandidate) {
+                            if (authenticated) {
+                                closePanel()
+                                bubble.text = "…"
+                                translateOnce()
+                            } else if (panel == null) {
+                                showAuthPanel()
+                            }
+                        } else {
+                            lastTapUpTime = android.os.SystemClock.uptimeMillis()
+                            pendingSingleTap = true
+                            handler.postDelayed(singleTap, doubleTapTimeout)
+                        }
+                    }
+                    secondTapCandidate = false
+                    scheduleFade()
+                    return true
+                }
+            }
+            return false
+        }
+    }
+
+    private fun snapBubbleToEdge() {
+        val (w, _) = screenSize()
+        bubbleParams.x = if (bubbleParams.x + bubble.width / 2 < w / 2) dp(6) else max(dp(6), w - bubble.width - dp(6))
+        windows.updateViewLayout(bubble, bubbleParams)
+        getSharedPreferences("overlay", MODE_PRIVATE).edit()
+            .putInt("bubble_x", bubbleParams.x).putInt("bubble_y", bubbleParams.y).apply()
+    }
+
+    private fun scheduleFade() {
+        handler.removeCallbacksAndMessages(FADE_TOKEN)
+        handler.postAtTime({ if (::bubble.isInitialized) bubble.animate().alpha(0.38f).setDuration(250).start() }, FADE_TOKEN, android.os.SystemClock.uptimeMillis() + 2_000)
+    }
+
+    private fun openPanel() {
+        if (panel == null) {
+            if (authenticated) showControlPanel() else showAuthPanel()
+        }
+    }
+
+    private fun showAuthPanel() {
+        val root = panelRoot()
+        val title = title("Đăng nhập B Dịch")
+        val username = EditText(this).apply { hint = "Tên tài khoản"; isSingleLine = true }
+        val password = EditText(this).apply {
+            hint = "Mật khẩu"; isSingleLine = true
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val status = TextView(this).apply { setTextColor(Color.DKGRAY); textSize = 14f }
+        val progress = ProgressBar(this).apply { visibility = View.GONE }
+        val login = Button(this).apply { text = "Đăng nhập" }
+        val register = Button(this).apply { text = "Đăng ký" }
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(login, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(register, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(8) })
+        }
+        fun submit(isRegister: Boolean) {
+            val name = username.text.toString().trim()
+            val pass = password.text.toString()
+            if (name.isBlank() || pass.isBlank()) { status.text = "Vui lòng nhập tài khoản và mật khẩu."; return }
+            login.isEnabled = false; register.isEnabled = false; progress.visibility = View.VISIBLE
+            serviceScope.launch {
+                val result = if (isRegister) accountApi.register(name, pass) else accountApi.login(name, pass)
+                if (result.success && result.sessionToken.isNotBlank()) {
+                    tokenStore.save(result.sessionToken)
+                    authenticated = true
+                    closePanel()
+                    showControlPanel()
+                    toast(result.message)
+                } else {
+                    status.text = result.message
+                    login.isEnabled = true; register.isEnabled = true; progress.visibility = View.GONE
+                }
+            }
+        }
+        login.setOnClickListener { submit(false) }
+        register.setOnClickListener { submit(true) }
+        root.addView(title)
+        root.addView(username)
+        root.addView(password)
+        root.addView(status, margins(top = 4))
+        root.addView(progress, centered())
+        root.addView(actions, margins(top = 8))
+        root.addView(closePanelButton(), margins(top = 10))
+        root.addView(exitButton(), margins(top = 10))
+        showPanel(root)
+    }
+
+    private fun showControlPanel() {
+        val root = panelRoot()
+        val prefs = getSharedPreferences("translation", MODE_PRIVATE)
+        source = LanguageCatalog.sources[prefs.getInt("source", 0).coerceIn(LanguageCatalog.sources.indices)]
+        target = LanguageCatalog.targets[prefs.getInt("target", 1).coerceIn(LanguageCatalog.targets.indices)]
+        val sourceSpinner = languageSpinner(LanguageCatalog.sources, LanguageCatalog.sources.indexOf(source)) { index ->
+            source = LanguageCatalog.sources[index]; prefs.edit().putInt("source", index).apply(); removeTranslationLayer()
+        }
+        val targetSpinner = languageSpinner(LanguageCatalog.targets, LanguageCatalog.targets.indexOf(target)) { index ->
+            target = LanguageCatalog.targets[index]; prefs.edit().putInt("target", index).apply(); removeTranslationLayer()
+        }
+        val continuousSwitch = Switch(this).apply {
+            text = "Dịch liên tục"
+            isChecked = continuous
+            setOnCheckedChangeListener { _, checked ->
+                continuous = checked
+                if (checked) {
+                    closePanel()
+                    startContinuous()
+                } else continuousJob?.cancel()
+            }
+        }
+        root.addView(title("Cài đặt dịch"))
+        root.addView(label("Ngôn ngữ cần dịch"), margins(top = 8))
+        root.addView(sourceSpinner)
+        root.addView(label("Ngôn ngữ sử dụng"), margins(top = 8))
+        root.addView(targetSpinner)
+        root.addView(continuousSwitch, margins(top = 10))
+        root.addView(TextView(this).apply {
+            text = "Bật: tự động dịch liên tục.\nTắt: nhấp đúp nút B để dịch một lần."
+            textSize = 13f; setTextColor(Color.DKGRAY)
+        }, margins(top = 4))
+        root.addView(closePanelButton(), margins(top = 12))
+        root.addView(exitButton(), margins(top = 12))
+        showPanel(root)
+    }
+
+    private fun validateSavedSession() {
+        val token = tokenStore.load()
+        if (token.isBlank()) return
+        checkingSession = true
+        serviceScope.launch {
+            val result = accountApi.checkSession(token)
+            checkingSession = false
+            authenticated = result.success
+            if (!result.success) tokenStore.clear()
+        }
+    }
+
+    private fun startCapture(resultCode: Int, data: Intent) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+        }
+        captureController?.close()
+        val (w, h) = screenSize()
+        captureController = ScreenCaptureController(this, resultCode, data, w, h, resources.displayMetrics.densityDpi)
+        toast("Đã bật quyền dịch màn hình.")
+        if (continuous) startContinuous() else translateOnce()
+    }
+
+    private fun ensureCapture(): Boolean {
+        if (captureController != null) return true
+        startActivity(Intent(this, MainActivity::class.java).setAction(MainActivity.ACTION_REQUEST_CAPTURE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        toast("Cho phép chụp màn hình để bắt đầu dịch.")
+        return false
+    }
+
+    private fun translateOnce() {
+        if (!authenticated) { showAuthPanel(); return }
+        if (translating || !ensureCapture()) return
+        translating = true
+        serviceScope.launch {
+            try {
+                translationLayer?.visibility = View.GONE
+                bubble.alpha = 0f
+                delay(80)
+                val bitmap = captureController?.capture() ?: return@launch
+                bubble.alpha = 1f
+                val result = withContext(Dispatchers.Default) { translator.translate(bitmap, source, target) }
+                bitmap.recycle()
+                renderTranslations(result)
+            } catch (error: Exception) {
+                toast("Chưa dịch được: ${error.message ?: "lỗi xử lý"}")
+            } finally {
+                translating = false
+                bubble.text = "B"
+                bubble.alpha = 1f
+                scheduleFade()
+            }
+        }
+    }
+
+    private fun startContinuous() {
+        if (!ensureCapture()) return
+        continuousJob?.cancel()
+        continuousJob = serviceScope.launch {
+            while (isActive && continuous) {
+                translateOnce()
+                delay(1_400)
+            }
+        }
+    }
+
+    private fun renderTranslations(lines: List<TranslatedLine>) {
+        removeTranslationLayer()
+        if (lines.isEmpty()) return
+        val layer = FrameLayout(this)
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        val (screenW, screenH) = screenSize()
+        lines.forEach { line ->
+            val box = Rect(line.box).apply {
+                left = left.coerceIn(0, max(0, screenW - 1)); right = right.coerceIn(left + 1, screenW)
+                top = top.coerceIn(0, max(0, screenH - 1)); bottom = bottom.coerceIn(top + 1, screenH)
+            }
+            val textView = TextView(this).apply {
+                text = line.text
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, max(dp(12).toFloat(), box.height() * 0.72f))
+                setPadding(dp(3), dp(1), dp(3), dp(1))
+                background = rounded(Color.argb(215, 20, 20, 20), dp(4).toFloat())
+                gravity = Gravity.CENTER_VERTICAL
+                maxLines = 2
+                minimumHeight = max(box.height(), dp(22))
+            }
+            layer.addView(textView, FrameLayout.LayoutParams(
+                min(screenW - box.left, max(box.width(), dp(40))), WindowManager.LayoutParams.WRAP_CONTENT
+            ).apply { leftMargin = box.left; topMargin = box.top })
+        }
+        windows.addView(layer, params)
+        translationLayer = layer
+    }
+
+    private fun removeTranslationLayer() {
+        translationLayer?.let { runCatching { windows.removeView(it) } }
+        translationLayer = null
+    }
+
+    private fun showPanel(content: View) {
+        closePanel()
+        val (screenW, screenH) = screenSize()
+        val scroll = ScrollView(this).apply { addView(content) }
+        val params = WindowManager.LayoutParams(
+            min(screenW - dp(24), dp(370)), min(screenH - dp(36), dp(580)),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.CENTER
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        }
+        windows.addView(scroll, params)
+        panel = scroll
+    }
+
+    private fun closePanel() {
+        panel?.let { runCatching { windows.removeView(it) } }
+        panel = null
+    }
+
+    private fun panelRoot() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(18), dp(16), dp(18), dp(16))
+        background = rounded(Color.rgb(248, 249, 252), dp(18).toFloat())
+    }
+
+    private fun title(value: String) = TextView(this).apply { text = value; textSize = 22f; setTextColor(Color.BLACK) }
+    private fun label(value: String) = TextView(this).apply { text = value; textSize = 14f; setTextColor(Color.DKGRAY) }
+
+    private fun languageSpinner(options: List<LanguageOption>, selected: Int, changed: (Int) -> Unit) = Spinner(this).apply {
+        adapter = ArrayAdapter(this@OverlayService, android.R.layout.simple_spinner_dropdown_item, options.map { it.label })
+        setSelection(selected)
+        onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) = changed(position)
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+    }
+
+    private fun exitButton() = Button(this).apply {
+        text = "Tắt B"
+        setTextColor(Color.WHITE)
+        background = rounded(Color.rgb(190, 35, 46), dp(10).toFloat())
+        setOnClickListener { stopSelf() }
+    }
+
+    private fun closePanelButton() = Button(this).apply {
+        text = "Đóng bảng"
+        setOnClickListener { closePanel() }
+    }
+
+    private fun rounded(color: Int, radius: Float) = GradientDrawable().apply { shape = GradientDrawable.RECTANGLE; setColor(color); cornerRadius = radius }
+    private fun margins(top: Int = 0) = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(top) }
+    private fun centered() = LinearLayout.LayoutParams(dp(32), dp(32)).apply { gravity = Gravity.CENTER_HORIZONTAL }
+    private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+    private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_SHORT).show()
+
+    private fun screenSize(): Pair<Int, Int> {
+        return if (Build.VERSION.SDK_INT >= 30) {
+            windows.maximumWindowMetrics.bounds.let { it.width() to it.height() }
+        } else {
+            val metrics = DisplayMetrics()
+            windows.defaultDisplay.getRealMetrics(metrics)
+            metrics.widthPixels to metrics.heightPixels
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, getString(R.string.notification_channel), NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+    }
+
+    private fun notification() = NotificationCompat.Builder(this, CHANNEL_ID)
+        .setSmallIcon(R.drawable.ic_notification)
+        .setContentTitle(getString(R.string.app_name))
+        .setContentText(getString(R.string.notification_text))
+        .setOngoing(true)
+        .setContentIntent(
+            PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        ).build()
+
+    companion object {
+        const val ACTION_SHOW = "com.dangtuan.btranslate.SHOW"
+        const val ACTION_STOP = "com.dangtuan.btranslate.STOP"
+        const val ACTION_START_CAPTURE = "com.dangtuan.btranslate.START_CAPTURE"
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val EXTRA_RESULT_DATA = "result_data"
+        private const val CHANNEL_ID = "b_overlay"
+        private const val NOTIFICATION_ID = 1001
+        private val FADE_TOKEN = Any()
+    }
+}

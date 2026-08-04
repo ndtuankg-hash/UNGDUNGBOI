@@ -1,0 +1,2 @@
+[functions.b-dich-api]
+verify_jwt = false

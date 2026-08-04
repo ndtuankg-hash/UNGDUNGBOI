@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">B Dịch</string>
+    <string name="notification_channel">Nút B đang hoạt động</string>
+    <string name="notification_text">Chạm để mở B Dịch</string>
+</resources>
