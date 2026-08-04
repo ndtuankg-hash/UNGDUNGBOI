@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
 
 jobs:
   build:
@@ -23,15 +21,40 @@ jobs:
       - name: Cai Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Tao APK cai truc tiep
+      - name: Khoi phuc khoa ky co dinh
+        if: github.event_name != 'pull_request'
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$RELEASE_KEYSTORE_BASE64"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > release.jks
+
+      - name: Kiem tra bien dich tren pull request
+        if: github.event_name == 'pull_request'
         run: ./gradlew --no-daemon assembleDebug
 
+      - name: Tao APK cai truc tiep
+        if: github.event_name != 'pull_request'
+        env:
+          ORG_GRADLE_PROJECT_RELEASE_STORE_FILE: release.jks
+          ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease
+
       - name: Doi ten APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk B-Dich-Android-v0.1.3.apk
+        if: github.event_name != 'pull_request'
+        id: package
+        run: |
+          VERSION_NAME=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
+          test -n "$VERSION_NAME"
+          cp app/build/outputs/apk/release/app-release.apk "B-Dich-Android-v${VERSION_NAME}.apk"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Luu file APK
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: B-Dich-Android-v0.1.3
-          path: B-Dich-Android-v0.1.3.apk
+          name: B-Dich-Android-v${{ steps.package.outputs.version_name }}
+          path: B-Dich-Android-v${{ steps.package.outputs.version_name }}.apk
           if-no-files-found: error
