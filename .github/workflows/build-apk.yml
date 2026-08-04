@@ -24,7 +24,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Khoi phuc khoa ky co dinh
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'agent/release-')
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
         run: |
@@ -32,11 +32,11 @@ jobs:
           printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > release.jks
 
       - name: Kiem tra bien dich tren pull request
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'agent/release-')
         run: ./gradlew --no-daemon assembleDebug
 
       - name: Tao APK cai truc tiep
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'agent/release-')
         env:
           ORG_GRADLE_PROJECT_RELEASE_STORE_FILE: release.jks
           ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
@@ -45,7 +45,7 @@ jobs:
         run: ./gradlew --no-daemon assembleRelease
 
       - name: Doi ten APK
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'agent/release-')
         id: package
         run: |
           VERSION_NAME=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
@@ -54,7 +54,7 @@ jobs:
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Luu file APK
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'agent/release-')
         uses: actions/upload-artifact@v4
         with:
           name: B-Dich-Android-v${{ steps.package.outputs.version_name }}
