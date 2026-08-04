@@ -3,3 +3,4 @@ sdk.dir=C\:\\Users\\YOUR_NAME\\AppData\\Local\\Android\\Sdk
 ACCOUNT_API_URL=https://slmyzhdnkwjkdwgwjhuh.supabase.co/functions/v1/account-api
 # Chỉ cần dòng dưới nếu Edge Function vẫn bật Verify JWT.
 # SUPABASE_ANON_KEY=YOUR_SUPABASE_ANON_KEY
+UPDATE_MANIFEST_URL=https://boi-ungdung1.pages.dev/version.json
