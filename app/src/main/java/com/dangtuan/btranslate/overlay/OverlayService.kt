@@ -1,5 +1,6 @@
 package com.dangtuan.btranslate.overlay
 
+import android.animation.ValueAnimator
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -8,6 +9,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
@@ -16,6 +19,9 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.Settings
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ReplacementSpan
 import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
@@ -23,6 +29,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
+import android.view.animation.LinearInterpolator
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -57,6 +64,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -80,6 +89,7 @@ class OverlayService : Service() {
     private var continuous = false
     private var continuousJob: Job? = null
     private var translating = false
+    private var waitingAnimator: ValueAnimator? = null
     private var latestUpdate: UpdateInfo? = null
     private var updateChecked = false
     private var source = LanguageCatalog.sources.first()
@@ -114,7 +124,9 @@ class OverlayService : Service() {
             }
             ACTION_SHOW, null -> if (!::bubble.isInitialized && Settings.canDrawOverlays(this)) showBubble()
         }
-        return START_STICKY
+        // Nếu Android đã dọn tiến trình thì quyền chụp màn hình cũ cũng không còn.
+        // Không tự dựng lại một nút B không thể dịch được.
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -137,6 +149,7 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        stopWaitingAnimation(showB = false)
         continuousJob?.cancel()
         captureController?.close()
         captureController = null
@@ -218,12 +231,12 @@ class OverlayService : Service() {
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     handler.removeCallbacks(longPress)
-                    bubble.text = "B"
+                    stopWaitingAnimation()
                     if (moved) {
                         snapBubbleToEdge()
                     } else if (event.actionMasked == MotionEvent.ACTION_UP && !longPressTriggered) {
                         closePanel()
-                        bubble.text = "…"
+                        startWaitingAnimation()
                         translateOnce()
                     }
                     scheduleFade()
@@ -245,6 +258,39 @@ class OverlayService : Service() {
     private fun scheduleFade() {
         handler.removeCallbacksAndMessages(FADE_TOKEN)
         handler.postAtTime({ if (::bubble.isInitialized) bubble.animate().alpha(0.38f).setDuration(250).start() }, FADE_TOKEN, android.os.SystemClock.uptimeMillis() + 2_000)
+    }
+
+    private fun startWaitingAnimation() {
+        waitingAnimator?.cancel()
+        waitingAnimator = ValueAnimator.ofInt(0, WAITING_DOT_LIFTS.lastIndex).apply {
+            duration = 900L
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            addUpdateListener { animator ->
+                if (!::bubble.isInitialized) return@addUpdateListener
+                val lifts = WAITING_DOT_LIFTS[animator.animatedValue as Int]
+                bubble.text = SpannableString(". . .").apply {
+                    DOT_POSITIONS.forEachIndexed { index, position ->
+                        val lift = lifts[index]
+                        if (lift > 0) {
+                            setSpan(
+                                LiftSpan(dp(lift)),
+                                position,
+                                position + 1,
+                                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                            )
+                        }
+                    }
+                }
+            }
+            start()
+        }
+    }
+
+    private fun stopWaitingAnimation(showB: Boolean = true) {
+        waitingAnimator?.cancel()
+        waitingAnimator = null
+        if (showB && ::bubble.isInitialized) bubble.text = "B"
     }
 
     private fun openPanel() {
@@ -335,15 +381,15 @@ class OverlayService : Service() {
             textSize = 13f; setTextColor(Color.DKGRAY)
         }, margins(top = 4))
         val updateStatus = TextView(this).apply {
-            text = "Phiên bản hiện tại: ${BuildConfig.VERSION_NAME}"
             textSize = 13f; setTextColor(Color.DKGRAY)
         }
         val updateButton = Button(this).apply {
-            text = latestUpdate?.let { "Cập nhật lên ${it.versionName}" } ?: "Kiểm tra cập nhật"
+            text = "Kiểm tra phiên bản mới"
             setOnClickListener {
-                latestUpdate?.let(::startUpdate) ?: checkForUpdate(this, updateStatus, showCurrentToast = true)
+                checkForUpdate(this, updateStatus, showCurrentToast = true)
             }
         }
+        showUpdateStatus(updateStatus, latestUpdate)
         root.addView(updateStatus, margins(top = 12))
         root.addView(updateButton, margins(top = 4))
         root.addView(closePanelButton(), margins(top = 12))
@@ -362,22 +408,28 @@ class OverlayService : Service() {
                 latestUpdate = result
                 if (!button.isAttachedToWindow) return@launch
                 button.isEnabled = true
-                if (result == null) {
-                    button.text = "Kiểm tra cập nhật"
-                    status.text = "Phiên bản ${BuildConfig.VERSION_NAME} đang là bản mới nhất."
-                    if (showCurrentToast) toast("Bạn đang dùng bản mới nhất.")
-                } else {
-                    button.text = "Cập nhật lên ${result.versionName}"
-                    status.text = result.notes.ifBlank { "Đã có phiên bản ${result.versionName}." }
-                }
+                button.text = "Kiểm tra phiên bản mới"
+                showUpdateStatus(status, result)
+                if (result == null && showCurrentToast) toast("Bạn đang dùng bản mới nhất.")
             } catch (error: Exception) {
                 if (!button.isAttachedToWindow) return@launch
                 button.isEnabled = true
-                button.text = "Thử kiểm tra lại"
-                status.text = "Chưa kiểm tra được cập nhật."
+                button.text = "Kiểm tra phiên bản mới"
+                showUpdateStatus(status, latestUpdate)
                 if (showCurrentToast) toast(error.message ?: "Lỗi kiểm tra cập nhật")
             }
         }
+    }
+
+    private fun showUpdateStatus(status: TextView, update: UpdateInfo?) {
+        status.setTextColor(if (update == null) Color.DKGRAY else Color.rgb(0, 102, 204))
+        status.text = if (update == null) {
+            "Phiên bản hiện tại: ${BuildConfig.VERSION_NAME}"
+        } else {
+            "Đã có phiên bản mới"
+        }
+        status.isClickable = update != null
+        status.setOnClickListener(if (update == null) null else View.OnClickListener { startUpdate(update) })
     }
 
     private fun startUpdate(info: UpdateInfo) {
@@ -413,7 +465,16 @@ class OverlayService : Service() {
         }
         captureController?.close()
         val (w, h) = screenSize()
-        captureController = ScreenCaptureController(this, resultCode, data, w, h, resources.displayMetrics.densityDpi)
+        captureController = ScreenCaptureController(
+            this,
+            resultCode,
+            data,
+            w,
+            h,
+            resources.displayMetrics.densityDpi
+        ) {
+            handler.post { stopBecauseCaptureDisconnected() }
+        }
         toast("Đã bật quyền dịch màn hình.")
         if (continuous) startContinuous() else translateOnce()
     }
@@ -434,20 +495,37 @@ class OverlayService : Service() {
                 translationLayer?.visibility = View.GONE
                 bubble.alpha = 0f
                 delay(80)
-                val bitmap = captureController?.capture() ?: return@launch
+                val controller = captureController ?: return@launch
+                val bitmap = withTimeout(CAPTURE_TIMEOUT_MS) { controller.capture() }
                 bubble.alpha = 1f
                 val result = withContext(Dispatchers.Default) { translator.translate(bitmap, source, target) }
                 bitmap.recycle()
                 renderTranslations(result)
+            } catch (_: TimeoutCancellationException) {
+                // Sau khi tắt màn hình lâu, MediaProjection đôi khi không báo onStop
+                // nhưng cũng không cấp ảnh mới. Khi đó nút B phải biến mất thay vì
+                // mắc kẹt ở dấu ba chấm.
+                stopBecauseCaptureDisconnected()
             } catch (error: Exception) {
                 toast("Chưa dịch được: ${error.message ?: "lỗi xử lý"}")
             } finally {
                 translating = false
-                bubble.text = "B"
+                stopWaitingAnimation()
                 bubble.alpha = 1f
                 scheduleFade()
             }
         }
+    }
+
+    private fun stopBecauseCaptureDisconnected() {
+        if (!::bubble.isInitialized) return
+        stopWaitingAnimation(showB = false)
+        continuous = false
+        continuousJob?.cancel()
+        continuousJob = null
+        captureController?.close()
+        captureController = null
+        stopSelf()
     }
 
     private fun startContinuous() {
@@ -602,6 +680,40 @@ class OverlayService : Service() {
         const val EXTRA_RESULT_DATA = "result_data"
         private const val CHANNEL_ID = "b_overlay"
         private const val NOTIFICATION_ID = 1001
+        private const val CAPTURE_TIMEOUT_MS = 5_000L
         private val FADE_TOKEN = Any()
+        private val DOT_POSITIONS = intArrayOf(0, 2, 4)
+        private val WAITING_DOT_LIFTS = arrayOf(
+            intArrayOf(0, 0, 0),
+            intArrayOf(6, 0, 0),
+            intArrayOf(2, 6, 0),
+            intArrayOf(0, 2, 6),
+            intArrayOf(0, 0, 2),
+            intArrayOf(0, 0, 0)
+        )
+    }
+
+    private class LiftSpan(private val liftPx: Int) : ReplacementSpan() {
+        override fun getSize(
+            paint: Paint,
+            text: CharSequence,
+            start: Int,
+            end: Int,
+            fm: Paint.FontMetricsInt?
+        ): Int = kotlin.math.ceil(paint.measureText(text, start, end).toDouble()).toInt()
+
+        override fun draw(
+            canvas: Canvas,
+            text: CharSequence,
+            start: Int,
+            end: Int,
+            x: Float,
+            top: Int,
+            y: Int,
+            bottom: Int,
+            paint: Paint
+        ) {
+            canvas.drawText(text, start, end, x, y - liftPx.toFloat(), paint)
+        }
     }
 }
