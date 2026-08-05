@@ -34,6 +34,7 @@ class MainActivity : AppCompatActivity() {
     private var updateRequested = false
     private var updateDownloadStarted = false
     private var installPermissionOpened = false
+    private var notificationPermissionPending = false
     private var updateUrl = ""
     private var updateVersion = ""
     private var updateSha256 = ""
@@ -54,14 +55,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val notificationLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val notificationLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        notificationPermissionPending = false
+        if (Settings.canDrawOverlays(this) && !captureRequested && !updateRequested) finish()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         captureRequested = intent?.action == ACTION_REQUEST_CAPTURE
         readUpdateRequest(intent)
         buildContent()
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionPending = true
             notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
@@ -80,16 +87,21 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         if (!Settings.canDrawOverlays(this)) {
-            status.text = "B Dịch cần quyền “Hiển thị trên ứng dụng khác”."
+            status.text = "Nhấn “Cho phép nút B nổi” để cấp quyền hiển thị trên ứng dụng khác."
             return
         }
         ContextCompat.startForegroundService(this, Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_SHOW))
         if (updateRequested) {
             continueUpdateIfReady()
-        } else {
-            status.text = "Nút B đang hoạt động. Bạn có thể đóng màn hình này."
-            requestCaptureIfReady()
+            return
         }
+        if (captureRequested) {
+            requestCaptureIfReady()
+            return
+        }
+
+        // Khi đã có quyền, mở ứng dụng là hiện nút B ngay và không cần hiện bảng điều khiển.
+        if (!notificationPermissionPending) finish()
     }
 
     private fun readUpdateRequest(source: Intent?) {
@@ -191,15 +203,6 @@ class MainActivity : AppCompatActivity() {
                 startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
             }
         }
-        val open = Button(this).apply {
-            text = "Bật nút B"
-            setOnClickListener {
-                if (Settings.canDrawOverlays(this@MainActivity)) {
-                    ContextCompat.startForegroundService(this@MainActivity, Intent(this@MainActivity, OverlayService::class.java).setAction(OverlayService.ACTION_SHOW))
-                    finish()
-                } else permission.performClick()
-            }
-        }
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(padding, padding * 2, padding, padding)
@@ -210,7 +213,6 @@ class MainActivity : AppCompatActivity() {
             addView(TextView(this@MainActivity).apply { text = "B Dịch"; textSize = 30f })
             addView(status, LinearLayout.LayoutParams(-1, -2).apply { topMargin = padding })
             addView(permission, LinearLayout.LayoutParams(-1, -2).apply { topMargin = padding })
-            addView(open, LinearLayout.LayoutParams(-1, -2).apply { topMargin = padding / 2 })
         })
     }
 
