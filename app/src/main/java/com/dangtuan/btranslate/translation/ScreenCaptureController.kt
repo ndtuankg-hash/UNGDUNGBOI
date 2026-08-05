@@ -12,6 +12,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.HandlerThread
 import kotlinx.coroutines.CompletableDeferred
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class ScreenCaptureController(
@@ -20,7 +21,8 @@ class ScreenCaptureController(
     resultData: Intent,
     private var width: Int,
     private var height: Int,
-    private val density: Int
+    private val density: Int,
+    private val onDisconnected: () -> Unit
 ) {
     private val projection: MediaProjection = context.getSystemService(MediaProjectionManager::class.java)
         .getMediaProjection(resultCode, resultData)
@@ -28,11 +30,17 @@ class ScreenCaptureController(
     private val handler = Handler(thread.looper)
     private var reader = makeReader(width, height)
     private val waiting = AtomicReference<CompletableDeferred<Bitmap>?>(null)
+    private val connected = AtomicBoolean(true)
     private val display: VirtualDisplay
 
     init {
         projection.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { waiting.getAndSet(null)?.cancel() }
+            override fun onStop() {
+                if (connected.getAndSet(false)) {
+                    waiting.getAndSet(null)?.cancel()
+                    onDisconnected()
+                }
+            }
             override fun onCapturedContentResize(capturedWidth: Int, capturedHeight: Int) {
                 resize(capturedWidth, capturedHeight)
             }
@@ -45,6 +53,7 @@ class ScreenCaptureController(
     }
 
     suspend fun capture(): Bitmap {
+        check(connected.get()) { "Kết nối chụp màn hình đã ngắt" }
         val deferred = CompletableDeferred<Bitmap>()
         waiting.getAndSet(deferred)?.cancel()
         return deferred.await()
@@ -64,6 +73,7 @@ class ScreenCaptureController(
     }
 
     fun close() {
+        connected.set(false)
         waiting.getAndSet(null)?.cancel()
         display.release()
         reader.close()
