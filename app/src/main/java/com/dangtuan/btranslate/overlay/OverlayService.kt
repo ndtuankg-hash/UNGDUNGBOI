@@ -12,7 +12,8 @@ import android.graphics.Color
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.PixelFormat
-import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
@@ -23,7 +24,6 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ReplacementSpan
 import android.util.DisplayMetrics
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -542,7 +542,12 @@ class OverlayService : Service() {
     private fun renderTranslations(lines: List<TranslatedLine>) {
         removeTranslationLayer()
         if (lines.isEmpty()) return
-        val layer = FrameLayout(this)
+        val layer = FrameLayout(this).apply {
+            addView(TranslationCanvasView(lines), FrameLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT
+            ))
+        }
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -550,26 +555,6 @@ class OverlayService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
-        val (screenW, screenH) = screenSize()
-        lines.forEach { line ->
-            val box = Rect(line.box).apply {
-                left = left.coerceIn(0, max(0, screenW - 1)); right = right.coerceIn(left + 1, screenW)
-                top = top.coerceIn(0, max(0, screenH - 1)); bottom = bottom.coerceIn(top + 1, screenH)
-            }
-            val textView = TextView(this).apply {
-                text = line.text
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, max(dp(12).toFloat(), box.height() * 0.72f))
-                setPadding(dp(3), dp(1), dp(3), dp(1))
-                background = rounded(Color.argb(215, 20, 20, 20), dp(4).toFloat())
-                gravity = Gravity.CENTER_VERTICAL
-                maxLines = 2
-                minimumHeight = max(box.height(), dp(22))
-            }
-            layer.addView(textView, FrameLayout.LayoutParams(
-                min(screenW - box.left, max(box.width(), dp(40))), WindowManager.LayoutParams.WRAP_CONTENT
-            ).apply { leftMargin = box.left; topMargin = box.top })
-        }
         layer.setOnTouchListener { _, event ->
             if (event.actionMasked == MotionEvent.ACTION_DOWN) removeTranslationLayer()
             true
@@ -583,8 +568,62 @@ class OverlayService : Service() {
     }
 
     private fun removeTranslationLayer() {
-        translationLayer?.let { runCatching { windows.removeView(it) } }
+        translationLayer?.let { layer ->
+            (layer.getChildAt(0) as? TranslationCanvasView)?.release()
+            runCatching { windows.removeView(layer) }
+        }
         translationLayer = null
+    }
+
+    /**
+     * Vẽ tất cả kết quả trên một canvas toàn màn hình. Mỗi TextLine có đúng một
+     * nền đã tái tạo và một lần vẽ chữ, nên không còn các TextView nhỏ bị lệch.
+     */
+    private inner class TranslationCanvasView(
+        private val lines: List<TranslatedLine>
+    ) : View(this@OverlayService) {
+        private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
+            typeface = Typeface.DEFAULT
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            lines.forEach { line ->
+                if (line.background.isRecycled) return@forEach
+                canvas.drawBitmap(line.background, null, RectF(line.backgroundBox), backgroundPaint)
+                drawFittedLine(canvas, line)
+            }
+        }
+
+        private fun drawFittedLine(canvas: Canvas, line: TranslatedLine) {
+            val box = RectF(line.box)
+            val availableWidth = max(1f, box.width() - max(2f, box.height() * 0.08f))
+            val availableHeight = max(1f, box.height() * 0.90f)
+            textPaint.color = line.textColor
+            textPaint.textSize = fittedTextSize(line.text, availableWidth, availableHeight)
+
+            val metrics = textPaint.fontMetrics
+            val baseline = box.centerY() - (metrics.ascent + metrics.descent) / 2f
+            canvas.drawText(line.text, box.left, baseline, textPaint)
+        }
+
+        private fun fittedTextSize(text: String, availableWidth: Float, availableHeight: Float): Float {
+            var low = max(5f, availableHeight * 0.28f)
+            var high = max(low, availableHeight)
+            repeat(12) {
+                val candidate = (low + high) / 2f
+                textPaint.textSize = candidate
+                if (textPaint.measureText(text) <= availableWidth) low = candidate else high = candidate
+            }
+            return low
+        }
+
+        fun release() {
+            lines.forEach { line ->
+                if (!line.background.isRecycled) line.background.recycle()
+            }
+        }
     }
 
     private fun showPanel(content: View) {
