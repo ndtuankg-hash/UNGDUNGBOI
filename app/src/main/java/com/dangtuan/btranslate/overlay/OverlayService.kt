@@ -12,6 +12,7 @@ import android.graphics.Color
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -22,6 +23,9 @@ import android.os.Looper
 import android.provider.Settings
 import android.text.SpannableString
 import android.text.Spanned
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
 import android.text.style.ReplacementSpan
 import android.util.DisplayMetrics
 import android.view.Gravity
@@ -50,7 +54,7 @@ import com.dangtuan.btranslate.auth.TokenStore
 import com.dangtuan.btranslate.translation.LanguageCatalog
 import com.dangtuan.btranslate.translation.LanguageOption
 import com.dangtuan.btranslate.translation.ScreenCaptureController
-import com.dangtuan.btranslate.translation.TranslatedLine
+import com.dangtuan.btranslate.translation.TranslatedParagraph
 import com.dangtuan.btranslate.translation.TranslationEngine
 import com.dangtuan.btranslate.ui.MainActivity
 import com.dangtuan.btranslate.update.UpdateChecker
@@ -475,12 +479,17 @@ class OverlayService : Service() {
         ) {
             handler.post { stopBecauseCaptureDisconnected() }
         }
-        toast("Đã bật quyền dịch màn hình.")
-        if (continuous) startContinuous() else translateOnce()
+        // Cấp quyền chỉ chuẩn bị phiên chụp. Không tự chụp hoặc dịch màn hình
+        // đang hiển thị sau khi người dùng vừa xác nhận với Android.
+        stopWaitingAnimation()
+        bubble.alpha = 1f
+        toast("Đã sẵn sàng. Nhấn B để bắt đầu dịch.")
+        scheduleFade()
     }
 
     private fun ensureCapture(): Boolean {
         if (captureController != null) return true
+        stopWaitingAnimation()
         startActivity(Intent(this, MainActivity::class.java).setAction(MainActivity.ACTION_REQUEST_CAPTURE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         toast("Cho phép chụp màn hình để bắt đầu dịch.")
         return false
@@ -539,11 +548,11 @@ class OverlayService : Service() {
         }
     }
 
-    private fun renderTranslations(lines: List<TranslatedLine>) {
+    private fun renderTranslations(paragraphs: List<TranslatedParagraph>) {
         removeTranslationLayer()
-        if (lines.isEmpty()) return
+        if (paragraphs.isEmpty()) return
         val layer = FrameLayout(this).apply {
-            addView(TranslationCanvasView(lines), FrameLayout.LayoutParams(
+            addView(TranslationCanvasView(paragraphs), FrameLayout.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT
             ))
@@ -576,54 +585,53 @@ class OverlayService : Service() {
     }
 
     /**
-     * Vẽ tất cả kết quả trên một canvas toàn màn hình. Mỗi TextLine có đúng một
-     * nền đã tái tạo và một lần vẽ chữ, nên không còn các TextView nhỏ bị lệch.
+     * Mỗi đoạn OCR được vẽ thành đúng một bảng. Bản dịch giữ một cỡ chữ chung
+     * và tự xuống hàng trong chiều rộng của đoạn, không co riêng từng dòng.
      */
     private inner class TranslationCanvasView(
-        private val lines: List<TranslatedLine>
+        private val paragraphs: List<TranslatedParagraph>
     ) : View(this@OverlayService) {
-        private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
+        private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
             typeface = Typeface.DEFAULT
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            lines.forEach { line ->
-                if (line.background.isRecycled) return@forEach
-                canvas.drawBitmap(line.background, null, RectF(line.backgroundBox), backgroundPaint)
-                drawFittedLine(canvas, line)
+            paragraphs.forEach { paragraph ->
+                drawParagraph(canvas, paragraph)
             }
         }
 
-        private fun drawFittedLine(canvas: Canvas, line: TranslatedLine) {
-            val box = RectF(line.box)
-            val availableWidth = max(1f, box.width() - max(2f, box.height() * 0.08f))
-            val availableHeight = max(1f, box.height() * 0.90f)
-            textPaint.color = line.textColor
-            textPaint.textSize = fittedTextSize(line.text, availableWidth, availableHeight)
+        private fun drawParagraph(canvas: Canvas, paragraph: TranslatedParagraph) {
+            val box = Rect(paragraph.box)
+            val availableWidth = max(1, box.width())
+            textPaint.color = paragraph.textColor
+            textPaint.textSize = paragraph.textSizePx
+            val layout = StaticLayout.Builder.obtain(
+                paragraph.text,
+                0,
+                paragraph.text.length,
+                textPaint,
+                availableWidth
+            )
+                .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                .setIncludePad(false)
+                .setLineSpacing(0f, 1f)
+                .build()
 
-            val metrics = textPaint.fontMetrics
-            val baseline = box.centerY() - (metrics.ascent + metrics.descent) / 2f
-            canvas.drawText(line.text, box.left, baseline, textPaint)
+            // Nếu tiếng Việt dài hơn, bảng được kéo xuống đủ để chứa nội dung.
+            // Cỡ chữ không bị thu nhỏ và điểm neo vẫn là góc trái trên của đoạn gốc.
+            val tableBottom = max(box.bottom, box.top + layout.height)
+            backgroundPaint.color = paragraph.backgroundColor
+            canvas.drawRect(RectF(box.left.toFloat(), box.top.toFloat(), box.right.toFloat(), tableBottom.toFloat()), backgroundPaint)
+            canvas.save()
+            canvas.translate(box.left.toFloat(), box.top.toFloat())
+            layout.draw(canvas)
+            canvas.restore()
         }
 
-        private fun fittedTextSize(text: String, availableWidth: Float, availableHeight: Float): Float {
-            var low = max(5f, availableHeight * 0.28f)
-            var high = max(low, availableHeight)
-            repeat(12) {
-                val candidate = (low + high) / 2f
-                textPaint.textSize = candidate
-                if (textPaint.measureText(text) <= availableWidth) low = candidate else high = candidate
-            }
-            return low
-        }
-
-        fun release() {
-            lines.forEach { line ->
-                if (!line.background.isRecycled) line.background.recycle()
-            }
-        }
+        fun release() = Unit
     }
 
     private fun showPanel(content: View) {

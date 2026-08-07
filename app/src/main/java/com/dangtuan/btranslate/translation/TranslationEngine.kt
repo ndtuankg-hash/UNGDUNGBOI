@@ -18,19 +18,24 @@ import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.tasks.await
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-data class TranslatedLine(
+data class TranslatedParagraph(
     val text: String,
     val box: Rect,
-    val backgroundBox: Rect,
-    val background: Bitmap,
-    val textColor: Int
+    val backgroundColor: Int,
+    val textColor: Int,
+    val textSizePx: Float
 )
 
 class TranslationEngine {
-    suspend fun translate(bitmap: Bitmap, source: LanguageOption, target: LanguageOption): List<TranslatedLine> {
+    suspend fun translate(
+        bitmap: Bitmap,
+        source: LanguageOption,
+        target: LanguageOption
+    ): List<TranslatedParagraph> {
         if (source.code == target.code) return emptyList()
 
         val recognizer = recognizerFor(source.ocr)
@@ -40,13 +45,18 @@ class TranslationEngine {
             recognizer.close()
         }
 
-        val languageIdentifier = LanguageIdentification.getClient()
+        val paragraphCandidates = recognizedText.textBlocks.flatMap { block ->
+            splitIntoParagraphs(block.lines.mapNotNull(::lineInfo))
+        }
+        if (paragraphCandidates.isEmpty()) return emptyList()
+
+        val identifier = LanguageIdentification.getClient()
         val plans = try {
-            recognizedText.textBlocks
-                .flatMap { it.lines }
-                .mapNotNull { planLine(it, source.code, target.code, languageIdentifier) }
+            paragraphCandidates.mapNotNull { candidate ->
+                planParagraph(candidate, source.code, target.code, identifier)
+            }
         } finally {
-            languageIdentifier.close()
+            identifier.close()
         }
         if (plans.isEmpty()) return emptyList()
 
@@ -64,86 +74,147 @@ class TranslationEngine {
         }
     }
 
-    private suspend fun planLine(
-        line: Text.Line,
+    private fun lineInfo(line: Text.Line): LineInfo? {
+        val box = line.boundingBox ?: return null
+        if (line.text.isBlank()) return null
+        return LineInfo(
+            text = line.text.trim(),
+            box = Rect(box),
+            elements = line.elements.mapNotNull { element ->
+                element.boundingBox?.let { ElementPart(element.text, Rect(it)) }
+            }
+        )
+    }
+
+    /**
+     * Không giới hạn số dòng. Các dòng tiếp tục thuộc cùng một đoạn khi chúng
+     * cùng cột, có chiều cao gần nhau và khe dọc vẫn gần với nhịp của đoạn.
+     */
+    private fun splitIntoParagraphs(lines: List<LineInfo>): List<ParagraphCandidate> {
+        if (lines.isEmpty()) return emptyList()
+        val sorted = lines.sortedWith(compareBy<LineInfo> { it.box.top }.thenBy { it.box.left })
+        val result = mutableListOf<ParagraphCandidate>()
+        var current = mutableListOf(sorted.first())
+        val acceptedGaps = mutableListOf<Int>()
+
+        fun flush() {
+            if (current.isNotEmpty()) result += ParagraphCandidate(current.toList())
+            current = mutableListOf()
+            acceptedGaps.clear()
+        }
+
+        for (next in sorted.drop(1)) {
+            val previous = current.last()
+            val gap = next.box.top - previous.box.bottom
+            if (continuesParagraph(current, acceptedGaps, next, gap)) {
+                current += next
+                acceptedGaps += max(0, gap)
+            } else {
+                flush()
+                current += next
+            }
+        }
+        flush()
+        return result
+    }
+
+    private fun continuesParagraph(
+        current: List<LineInfo>,
+        acceptedGaps: List<Int>,
+        next: LineInfo,
+        gap: Int
+    ): Boolean {
+        val previous = current.last()
+        val typicalHeight = median((current.map { it.box.height() } + next.box.height()).filter { it > 0 })
+        val heightRatio = max(previous.box.height(), next.box.height()).toFloat() /
+            max(1, min(previous.box.height(), next.box.height())).toFloat()
+        if (heightRatio > MAX_LINE_HEIGHT_RATIO) return false
+        if (gap < -typicalHeight * 0.35f) return false
+
+        val overlap = min(previous.box.right, next.box.right) - max(previous.box.left, next.box.left)
+        val minimumWidth = max(1, min(previous.box.width(), next.box.width()))
+        val leftDifference = abs(previous.box.left - next.box.left)
+        val sameColumn = overlap >= minimumWidth * MIN_HORIZONTAL_OVERLAP ||
+            leftDifference <= max(typicalHeight * MAX_LEFT_SHIFT_IN_HEIGHTS, MIN_LEFT_SHIFT_PX.toFloat())
+        if (!sameColumn) return false
+
+        if (acceptedGaps.isEmpty()) {
+            return gap <= typicalHeight * FIRST_GAP_IN_HEIGHTS
+        }
+
+        val expectedGap = acceptedGaps.average().toFloat()
+        val tolerance = max(typicalHeight * GAP_TOLERANCE_IN_HEIGHTS, expectedGap * 0.75f + 2f)
+        return gap <= expectedGap + tolerance
+    }
+
+    private suspend fun planParagraph(
+        candidate: ParagraphCandidate,
         sourceCode: String,
         targetCode: String,
         identifier: LanguageIdentifier
-    ): LinePlan? {
-        val lineBox = line.boundingBox ?: return null
-        val elements = line.elements.mapNotNull { element ->
-            element.boundingBox?.let { ElementPart(element.text, Rect(it)) }
+    ): ParagraphPlan? {
+        val parts = candidate.lines.flatMap { line ->
+            if (line.elements.isEmpty()) listOf(ElementPart(line.text, line.box)) else line.elements
         }
-        if (elements.isEmpty()) {
-            return when (classify(line.text, sourceCode, targetCode, identifier)) {
-                LanguageRole.SOURCE -> LinePlan(Rect(lineBox), listOf(Segment(line.text, Rect(lineBox), true)))
-                else -> null
-            }
-        }
+        val roles = parts.map { classify(it.text, sourceCode, targetCode, identifier) }
+        val sourceCount = roles.count { it == LanguageRole.SOURCE }
+        val targetCount = roles.count { it == LanguageRole.TARGET }
+        val otherCount = roles.count { it == LanguageRole.OTHER }
+        if (sourceCount == 0 || sourceCount < max(targetCount, otherCount)) return null
 
-        val classified = elements.map { part ->
-            ClassifiedPart(part, classify(part.text, sourceCode, targetCode, identifier))
-        }
-        val meaningful = classified.filter { it.role != LanguageRole.NEUTRAL }
-        if (meaningful.isEmpty()) return null
-
-        // Số, ký hiệu và dấu câu là trung tính. Chúng không được phép làm một dòng
-        // thuần ngôn ngữ nguồn rơi xuống chế độ dịch từng từ như ở bản 0.1.5.
-        if (meaningful.all { it.role == LanguageRole.SOURCE }) {
-            return LinePlan(Rect(lineBox), listOf(Segment(line.text, Rect(lineBox), true)))
-        }
-        if (meaningful.none { it.role == LanguageRole.SOURCE }) return null
-
-        // Dòng thật sự trộn ngôn ngữ: chỉ dịch các chuỗi thuộc ngôn ngữ nguồn,
-        // giữ phần còn lại rồi ghép thành đúng một kết quả cho cả dòng.
-        val segments = mutableListOf<Segment>()
-        var index = 0
-        while (index < classified.size) {
-            val current = classified[index]
-            if (current.role != LanguageRole.SOURCE) {
-                segments += Segment(current.part.text, current.part.box, false)
-                index++
-                continue
-            }
-
-            val run = mutableListOf(current.part)
-            var end = index + 1
-            while (end < classified.size) {
-                val candidate = classified[end]
-                if (candidate.role == LanguageRole.SOURCE) {
-                    run += candidate.part
-                    end++
-                    continue
-                }
-                if (candidate.role == LanguageRole.NEUTRAL &&
-                    classified.drop(end + 1).firstOrNull { it.role != LanguageRole.NEUTRAL }?.role == LanguageRole.SOURCE
-                ) {
-                    run += candidate.part
-                    end++
-                    continue
-                }
-                break
-            }
-            segments += Segment(joinParts(run), union(run.map { it.box }), true)
-            index = end
-        }
-        return LinePlan(Rect(lineBox), segments)
+        val text = candidate.lines.joinToString(" ") { it.text }.replace(WHITESPACE, " ").trim()
+        if (text.isBlank()) return null
+        return ParagraphPlan(
+            text = text,
+            box = union(candidate.lines.map { it.box }),
+            firstLineBox = Rect(candidate.lines.first().box),
+            typicalLineHeight = median(candidate.lines.map { it.box.height() }.filter { it > 0 })
+        )
     }
 
-    private suspend fun renderPlan(bitmap: Bitmap, plan: LinePlan, translator: Translator): TranslatedLine {
-        val renderedSegments = plan.segments.map { segment ->
-            segment.copy(text = if (segment.translate) translator.translate(segment.text).await() else segment.text)
-        }
-        val translatedText = joinSegments(renderedSegments)
-        val backgroundBox = expandedBox(plan.box, bitmap.width, bitmap.height)
-        val background = inpaintLineBackground(bitmap, plan.box, backgroundBox)
-        return TranslatedLine(
+    private suspend fun renderPlan(
+        bitmap: Bitmap,
+        plan: ParagraphPlan,
+        translator: Translator
+    ): TranslatedParagraph {
+        val translatedText = translator.translate(plan.text).await().replace(WHITESPACE, " ").trim()
+        val backgroundColor = sampleOneBackgroundPoint(bitmap, plan.box, plan.firstLineBox)
+        return TranslatedParagraph(
             text = translatedText,
             box = Rect(plan.box),
-            backgroundBox = backgroundBox,
-            background = background,
-            textColor = estimateTextColor(bitmap, plan.box, backgroundBox, background)
+            backgroundColor = backgroundColor,
+            textColor = contrastingTextColor(backgroundColor),
+            textSizePx = max(MIN_TEXT_SIZE_PX, plan.typicalLineHeight * TEXT_SIZE_FROM_LINE_HEIGHT)
         )
+    }
+
+    /**
+     * Mỗi đoạn chỉ lấy đúng một pixel gần đầu đoạn rồi dùng màu đó cho toàn bảng.
+     * Ưu tiên điểm ngay trước dòng đầu; nếu sát mép màn hình thì lấy phía trên.
+     */
+    private fun sampleOneBackgroundPoint(bitmap: Bitmap, paragraph: Rect, firstLine: Rect): Int {
+        val distance = max(MIN_SAMPLE_DISTANCE_PX, firstLine.height() / 3)
+        val candidates = listOf(
+            (firstLine.left - distance) to firstLine.centerY(),
+            (firstLine.left + min(distance, max(0, firstLine.width() - 1))) to (firstLine.top - distance),
+            (paragraph.right + distance) to firstLine.centerY(),
+            paragraph.left to (paragraph.bottom + distance)
+        )
+        val point = candidates.firstOrNull { (x, y) ->
+            x in 0 until bitmap.width && y in 0 until bitmap.height
+        } ?: (
+            paragraph.left.coerceIn(0, bitmap.width - 1) to
+                paragraph.top.coerceIn(0, bitmap.height - 1)
+            )
+        return bitmap.getPixel(point.first, point.second)
+    }
+
+    private fun contrastingTextColor(background: Int): Int {
+        val luminance =
+            0.2126 * Color.red(background) +
+                0.7152 * Color.green(background) +
+                0.0722 * Color.blue(background)
+        return if (luminance > 145.0) Color.BLACK else Color.WHITE
     }
 
     private suspend fun classify(
@@ -170,15 +241,18 @@ class TranslationEngine {
             .filterKeys { it != sourceCode && it != targetCode && it != "und" }
             .values.maxOrNull() ?: 0f
 
-        if (sourceConfidence >= LANGUAGE_CONFIDENCE && sourceConfidence >= max(targetConfidence, strongestOther)) {
+        if (sourceConfidence >= LANGUAGE_CONFIDENCE &&
+            sourceConfidence >= max(targetConfidence, strongestOther)
+        ) {
             return LanguageRole.SOURCE
         }
-        if (targetConfidence >= LANGUAGE_CONFIDENCE && targetConfidence >= max(sourceConfidence, strongestOther)) {
+        if (targetConfidence >= LANGUAGE_CONFIDENCE &&
+            targetConfidence >= max(sourceConfidence, strongestOther)
+        ) {
             return LanguageRole.TARGET
         }
         if (strongestOther >= LANGUAGE_CONFIDENCE) return LanguageRole.OTHER
 
-        // ML Kit thường trả "und" cho nhãn giao diện tiếng Anh rất ngắn.
         if (looksLikeUndeterminedEnglish(value)) {
             return when ("en") {
                 sourceCode -> LanguageRole.SOURCE
@@ -189,160 +263,15 @@ class TranslationEngine {
         return LanguageRole.OTHER
     }
 
-    private fun joinParts(parts: List<ElementPart>): String = parts.joinToString(" ") { it.text }
-
-    private fun joinSegments(segments: List<Segment>): String = buildString {
-        segments.forEachIndexed { index, segment ->
-            if (index > 0 && needsSpace(segments[index - 1].text, segment.text)) append(' ')
-            append(segment.text.trim())
-        }
-    }.trim()
-
-    private fun needsSpace(previous: String, current: String): Boolean {
-        val left = previous.trim().lastOrNull() ?: return false
-        val right = current.trim().firstOrNull() ?: return false
-        if (right in CLOSING_PUNCTUATION || left in OPENING_PUNCTUATION) return false
-        if (right == '\'' || right == '’') return false
-        return true
-    }
-
     private fun union(boxes: List<Rect>): Rect = Rect(boxes.first()).also { result ->
         boxes.drop(1).forEach(result::union)
     }
 
-    private fun expandedBox(box: Rect, width: Int, height: Int): Rect {
-        val horizontal = max(2, box.height() / 12)
-        val vertical = max(2, box.height() / 8)
-        return Rect(
-            max(0, box.left - horizontal),
-            max(0, box.top - vertical),
-            min(width, box.right + horizontal),
-            min(height, box.bottom + vertical)
-        )
+    private fun median(values: List<Int>): Int {
+        if (values.isEmpty()) return 1
+        val sorted = values.sorted()
+        return sorted[sorted.size / 2]
     }
-
-    private fun inpaintLineBackground(source: Bitmap, textBox: Rect, outputBox: Rect): Bitmap {
-        val width = outputBox.width().coerceAtLeast(1)
-        val height = outputBox.height().coerceAtLeast(1)
-        val pixels = IntArray(width * height)
-        val topY = max(0, outputBox.top - 1)
-        val bottomY = min(source.height - 1, outputBox.bottom)
-
-        for (localX in 0 until width) {
-            val sourceX = (outputBox.left + localX).coerceIn(0, source.width - 1)
-            val topColor = sampleBand(source, sourceX, topY)
-            val bottomColor = sampleBand(source, sourceX, bottomY)
-            for (localY in 0 until height) {
-                val globalY = outputBox.top + localY
-                pixels[localY * width + localX] = if (globalY < textBox.top || globalY >= textBox.bottom) {
-                    source.getPixel(sourceX, globalY.coerceIn(0, source.height - 1))
-                } else {
-                    val amount = (globalY - textBox.top + 1f) / (textBox.height() + 1f)
-                    blend(topColor, bottomColor, amount)
-                }
-            }
-        }
-        return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
-    }
-
-    private fun sampleBand(bitmap: Bitmap, x: Int, y: Int): Int {
-        var red = 0
-        var green = 0
-        var blue = 0
-        var count = 0
-        for (offsetX in -2..2) {
-            val sampledX = (x + offsetX).coerceIn(0, bitmap.width - 1)
-            val color = bitmap.getPixel(sampledX, y)
-            red += Color.red(color)
-            green += Color.green(color)
-            blue += Color.blue(color)
-            count++
-        }
-        return Color.rgb(red / count, green / count, blue / count)
-    }
-
-    private fun blend(start: Int, end: Int, amount: Float): Int = Color.rgb(
-        (Color.red(start) + (Color.red(end) - Color.red(start)) * amount).toInt(),
-        (Color.green(start) + (Color.green(end) - Color.green(start)) * amount).toInt(),
-        (Color.blue(start) + (Color.blue(end) - Color.blue(start)) * amount).toInt()
-    )
-
-    private fun contrastingTextColor(background: Bitmap): Int {
-        var luminance = 0.0
-        var samples = 0
-        val stepX = max(1, background.width / 12)
-        val stepY = max(1, background.height / 6)
-        for (y in 0 until background.height step stepY) {
-            for (x in 0 until background.width step stepX) {
-                val color = background.getPixel(x, y)
-                luminance += 0.2126 * Color.red(color) + 0.7152 * Color.green(color) + 0.0722 * Color.blue(color)
-                samples++
-            }
-        }
-        return if (samples > 0 && luminance / samples > 145.0) Color.BLACK else Color.WHITE
-    }
-
-    private fun estimateTextColor(
-        source: Bitmap,
-        textBox: Rect,
-        backgroundBox: Rect,
-        reconstructedBackground: Bitmap
-    ): Int {
-        var weightedRed = 0.0
-        var weightedGreen = 0.0
-        var weightedBlue = 0.0
-        var totalWeight = 0.0
-        val clipped = Rect(textBox).apply { intersect(0, 0, source.width, source.height) }
-
-        for (y in clipped.top until clipped.bottom) {
-            for (x in clipped.left until clipped.right) {
-                val original = source.getPixel(x, y)
-                val background = reconstructedBackground.getPixel(
-                    (x - backgroundBox.left).coerceIn(0, reconstructedBackground.width - 1),
-                    (y - backgroundBox.top).coerceIn(0, reconstructedBackground.height - 1)
-                )
-                val difference = (
-                    kotlin.math.abs(Color.red(original) - Color.red(background)) +
-                        kotlin.math.abs(Color.green(original) - Color.green(background)) +
-                        kotlin.math.abs(Color.blue(original) - Color.blue(background))
-                    ).toDouble()
-                if (difference < MIN_GLYPH_DIFFERENCE) continue
-                val weight = difference * difference
-                weightedRed += Color.red(original) * weight
-                weightedGreen += Color.green(original) * weight
-                weightedBlue += Color.blue(original) * weight
-                totalWeight += weight
-            }
-        }
-        if (totalWeight == 0.0) return contrastingTextColor(reconstructedBackground)
-
-        val estimated = Color.rgb(
-            (weightedRed / totalWeight).toInt().coerceIn(0, 255),
-            (weightedGreen / totalWeight).toInt().coerceIn(0, 255),
-            (weightedBlue / totalWeight).toInt().coerceIn(0, 255)
-        )
-        val fallback = contrastingTextColor(reconstructedBackground)
-        val estimatedLuminance = luminance(estimated)
-        val backgroundLuminance = averageLuminance(reconstructedBackground)
-        return if (kotlin.math.abs(estimatedLuminance - backgroundLuminance) >= 55.0) estimated else fallback
-    }
-
-    private fun averageLuminance(bitmap: Bitmap): Double {
-        var total = 0.0
-        var count = 0
-        val stepX = max(1, bitmap.width / 12)
-        val stepY = max(1, bitmap.height / 6)
-        for (y in 0 until bitmap.height step stepY) {
-            for (x in 0 until bitmap.width step stepX) {
-                total += luminance(bitmap.getPixel(x, y))
-                count++
-            }
-        }
-        return if (count == 0) 0.0 else total / count
-    }
-
-    private fun luminance(color: Int): Double =
-        0.2126 * Color.red(color) + 0.7152 * Color.green(color) + 0.0722 * Color.blue(color)
 
     private fun looksLikeUndeterminedEnglish(value: String): Boolean =
         value.any { it in 'A'..'Z' || it in 'a'..'z' } && value.none(::isVietnameseSpecificLetter)
@@ -355,9 +284,11 @@ class TranslationEngine {
         else -> null
     }
 
-    private fun isVietnameseSpecificLetter(char: Char): Boolean = char.lowercaseChar() in VIETNAMESE_SPECIFIC_LETTERS
+    private fun isVietnameseSpecificLetter(char: Char): Boolean =
+        char.lowercaseChar() in VIETNAMESE_SPECIFIC_LETTERS
 
-    private fun normalizeLanguageCode(tag: String): String = tag.substringBefore('-').lowercase()
+    private fun normalizeLanguageCode(tag: String): String =
+        tag.substringBefore('-').lowercase()
 
     private fun recognizerFor(script: OcrScript): TextRecognizer = when (script) {
         OcrScript.CHINESE -> TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
@@ -367,16 +298,28 @@ class TranslationEngine {
     }
 
     private data class ElementPart(val text: String, val box: Rect)
-    private data class ClassifiedPart(val part: ElementPart, val role: LanguageRole)
-    private data class Segment(val text: String, val box: Rect, val translate: Boolean)
-    private data class LinePlan(val box: Rect, val segments: List<Segment>)
+    private data class LineInfo(val text: String, val box: Rect, val elements: List<ElementPart>)
+    private data class ParagraphCandidate(val lines: List<LineInfo>)
+    private data class ParagraphPlan(
+        val text: String,
+        val box: Rect,
+        val firstLineBox: Rect,
+        val typicalLineHeight: Int
+    )
     private enum class LanguageRole { SOURCE, TARGET, OTHER, NEUTRAL }
 
     private companion object {
         const val LANGUAGE_CONFIDENCE = 0.20f
-        const val MIN_GLYPH_DIFFERENCE = 80.0
-        val CLOSING_PUNCTUATION = setOf('.', ',', ':', ';', '!', '?', ')', ']', '}', '%')
-        val OPENING_PUNCTUATION = setOf('(', '[', '{')
+        const val MAX_LINE_HEIGHT_RATIO = 1.65f
+        const val MIN_HORIZONTAL_OVERLAP = 0.15f
+        const val MAX_LEFT_SHIFT_IN_HEIGHTS = 1.5f
+        const val MIN_LEFT_SHIFT_PX = 24
+        const val FIRST_GAP_IN_HEIGHTS = 1.25f
+        const val GAP_TOLERANCE_IN_HEIGHTS = 0.65f
+        const val MIN_SAMPLE_DISTANCE_PX = 3
+        const val MIN_TEXT_SIZE_PX = 8f
+        const val TEXT_SIZE_FROM_LINE_HEIGHT = 0.72f
+        val WHITESPACE = Regex("\\s+")
         val VIETNAMESE_SPECIFIC_LETTERS =
             "ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ".toSet()
     }
