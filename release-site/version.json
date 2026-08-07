@@ -1,7 +1,7 @@
 {
-  "versionCode": 5,
-  "versionName": "0.1.4",
-  "apkUrl": "",
-  "sha256": "",
-  "notes": "Bản đầu tiên hỗ trợ cập nhật ngay trong ứng dụng."
+  "versionCode": 8,
+  "versionName": "0.1.7",
+  "apkUrl": "https://github.com/ndtuankg-hash/UNGDUNGBOI/releases/download/v0.1.7/B-Dich-Android-v0.1.7.apk",
+  "sha256": "c17c9cd7e50797e426fbcaf5b2514a4aa950db50c119a817101a5acaa51e8e77",
+  "notes": "Xác nhận chia sẻ màn hình chỉ chuẩn bị phiên chụp; lần nhấn B tiếp theo mới dịch. Dịch nguyên đoạn và hiển thị trong một bảng nền duy nhất."
 }
