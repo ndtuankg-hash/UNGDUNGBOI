@@ -1,5 +1,8 @@
 name: Build B Dich APK
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
   push:
@@ -60,3 +63,17 @@ jobs:
           name: B-Dich-Android-v${{ steps.package.outputs.version_name }}
           path: B-Dich-Android-v${{ steps.package.outputs.version_name }}.apk
           if-no-files-found: error
+
+      - name: Tao GitHub Release khi xuat ban
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[release]')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_NAME: ${{ steps.package.outputs.version_name }}
+        run: |
+          TAG="v${VERSION_NAME}"
+          APK="B-Dich-Android-v${VERSION_NAME}.apk"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" --title "BOI Dịch ${VERSION_NAME}" --notes "Bản cập nhật BOI Dịch ${VERSION_NAME}."
+          fi
