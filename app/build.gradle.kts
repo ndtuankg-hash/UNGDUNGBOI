@@ -34,8 +34,8 @@ android {
         applicationId = "com.dangtuan.btranslate"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "0.1.8"
+        versionCode = 10
+        versionName = "0.1.9"
         buildConfigField("String", "ACCOUNT_API_URL", "\"${accountApiUrl.replace("\"", "\\\"")}\"")
         buildConfigField("String", "SUPABASE_ANON_KEY", "\"${supabaseAnonKey.replace("\"", "\\\"")}\"")
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"${updateManifestUrl.replace("\"", "\\\"")}\"")
