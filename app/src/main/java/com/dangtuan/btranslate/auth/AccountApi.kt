@@ -52,7 +52,7 @@ class AccountApi {
             if (connection.responseCode == 401 && json.optString("code") == "UNAUTHORIZED_NO_AUTH_HEADER") {
                 return@withContext AuthResult(
                     false,
-                    "Máy chủ đăng nhập chưa được cấu hình đúng. Vui lòng cập nhật B Dịch lên bản mới nhất."
+                    "Máy chủ đăng nhập chưa được cấu hình đúng. Vui lòng cập nhật BOI Dịch lên bản mới nhất."
                 )
             }
             val account = json.optJSONObject("account")

@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">B Dịch</string>
-    <string name="notification_channel">Nút B đang hoạt động</string>
-    <string name="notification_text">Chạm để mở B Dịch</string>
+    <string name="app_name">BOI Dịch</string>
+    <string name="notification_channel">Nút BOI đang hoạt động</string>
+    <string name="notification_text">Chạm để mở BOI Dịch</string>
 </resources>

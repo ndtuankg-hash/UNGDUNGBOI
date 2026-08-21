@@ -61,11 +61,9 @@ import com.dangtuan.btranslate.update.UpdateChecker
 import com.dangtuan.btranslate.update.UpdateInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -90,12 +88,11 @@ class OverlayService : Service() {
     private val updateChecker = UpdateChecker()
     private var authenticated = false
     private var checkingSession = false
-    private var continuous = false
-    private var continuousJob: Job? = null
     private var translating = false
     private var waitingAnimator: ValueAnimator? = null
     private var latestUpdate: UpdateInfo? = null
     private var updateChecked = false
+    private var openPanelRequested = false
     private var source = LanguageCatalog.sources.first()
     private var target = LanguageCatalog.targets.first { it.code == "vi" }
 
@@ -126,10 +123,14 @@ class OverlayService : Service() {
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
                 if (data != null) startCapture(resultCode, data)
             }
+            ACTION_OPEN_PANEL -> {
+                openPanelRequested = true
+                if (!checkingSession) openPanel()
+            }
             ACTION_SHOW, null -> if (!::bubble.isInitialized && Settings.canDrawOverlays(this)) showBubble()
         }
         // Nếu Android đã dọn tiến trình thì quyền chụp màn hình cũ cũng không còn.
-        // Không tự dựng lại một nút B không thể dịch được.
+        // Không tự dựng lại một nút BOI không thể dịch được.
         return START_NOT_STICKY
     }
 
@@ -154,7 +155,6 @@ class OverlayService : Service() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         stopWaitingAnimation(showB = false)
-        continuousJob?.cancel()
         captureController?.close()
         captureController = null
         closePanel()
@@ -167,13 +167,14 @@ class OverlayService : Service() {
     private fun showBubble() {
         if (::bubble.isInitialized) return
         bubble = TextView(this).apply {
-            text = "B"
-            textSize = 25f
+            text = "BOI"
+            textSize = 14f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             elevation = dp(8).toFloat()
             background = rounded(Color.rgb(43, 103, 246), dp(29).toFloat())
             setOnTouchListener(BubbleTouch())
+            visibility = View.GONE
         }
         val prefs = getSharedPreferences("overlay", MODE_PRIVATE)
         bubbleParams = WindowManager.LayoutParams(
@@ -294,18 +295,18 @@ class OverlayService : Service() {
     private fun stopWaitingAnimation(showB: Boolean = true) {
         waitingAnimator?.cancel()
         waitingAnimator = null
-        if (showB && ::bubble.isInitialized) bubble.text = "B"
+        if (showB && ::bubble.isInitialized) bubble.text = "BOI"
     }
 
     private fun openPanel() {
-        if (panel == null) {
+        if (panel == null && !checkingSession) {
             if (authenticated) showControlPanel() else showAuthPanel()
         }
     }
 
     private fun showAuthPanel() {
         val root = panelRoot()
-        val title = title("Đăng nhập B Dịch")
+        val title = title("Đăng nhập BOI Dịch")
         val username = EditText(this).apply { hint = "Tên tài khoản"; isSingleLine = true }
         val password = EditText(this).apply {
             hint = "Mật khẩu"; isSingleLine = true
@@ -363,25 +364,42 @@ class OverlayService : Service() {
         val targetSpinner = languageSpinner(LanguageCatalog.targets, LanguageCatalog.targets.indexOf(target)) { index ->
             target = LanguageCatalog.targets[index]; prefs.edit().putInt("target", index).apply(); removeTranslationLayer()
         }
-        val continuousSwitch = Switch(this).apply {
-            text = "Dịch liên tục"
-            isChecked = continuous
-            setOnCheckedChangeListener { _, checked ->
-                continuous = checked
-                if (checked) {
-                    closePanel()
-                    startContinuous()
-                } else continuousJob?.cancel()
+        val activityStatus = TextView(this).apply {
+            textSize = 15f
+            if (captureController == null) {
+                text = "●  Chưa hoạt động"
+                setTextColor(Color.rgb(205, 35, 45))
+            } else {
+                text = "●  Đang hoạt động"
+                setTextColor(Color.rgb(25, 145, 75))
             }
         }
-        root.addView(title("Cài đặt dịch"))
+        val bubbleSwitch = Switch(this).apply {
+            text = "Hiển thị nút BOI nổi"
+            isChecked = ::bubble.isInitialized && bubble.visibility == View.VISIBLE
+            setOnCheckedChangeListener { button, checked ->
+                if (checked && captureController == null) {
+                    button.isChecked = false
+                    toast("Hãy kích hoạt chia sẻ màn hình trước.")
+                    return@setOnCheckedChangeListener
+                }
+                bubble.visibility = if (checked) View.VISIBLE else View.GONE
+                if (checked) {
+                    bubble.alpha = 1f
+                    closePanel()
+                    scheduleFade()
+                }
+            }
+        }
+        root.addView(title("BOI Dịch"))
+        root.addView(activityStatus, margins(top = 4))
         root.addView(label("Ngôn ngữ cần dịch"), margins(top = 8))
         root.addView(sourceSpinner)
         root.addView(label("Ngôn ngữ sử dụng"), margins(top = 8))
         root.addView(targetSpinner)
-        root.addView(continuousSwitch, margins(top = 10))
+        root.addView(bubbleSwitch, margins(top = 10))
         root.addView(TextView(this).apply {
-            text = "Chạm B: dịch một lần.\nGiữ B: mở hoặc đóng bảng.\nGiữ rồi kéo: di chuyển nút B."
+            text = "Chạm BOI: dịch một lần.\nGiữ BOI: mở hoặc đóng bảng.\nGiữ rồi kéo: di chuyển nút BOI."
             textSize = 13f; setTextColor(Color.DKGRAY)
         }, margins(top = 4))
         val updateStatus = TextView(this).apply {
@@ -396,6 +414,22 @@ class OverlayService : Service() {
         showUpdateStatus(updateStatus, latestUpdate)
         root.addView(updateStatus, margins(top = 12))
         root.addView(updateButton, margins(top = 4))
+        root.addView(Button(this).apply {
+            text = if (captureController == null) {
+                "Kích hoạt trợ năng\nChia sẻ màn hình"
+            } else {
+                "Chia sẻ màn hình đã được kích hoạt"
+            }
+            isEnabled = captureController == null
+            setOnClickListener {
+                closePanel()
+                startActivity(
+                    Intent(this@OverlayService, MainActivity::class.java)
+                        .setAction(MainActivity.ACTION_REQUEST_CAPTURE)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+        }, margins(top = 8))
         root.addView(closePanelButton(), margins(top = 12))
         root.addView(exitButton(), margins(top = 12))
         showPanel(root)
@@ -456,6 +490,7 @@ class OverlayService : Service() {
             checkingSession = false
             authenticated = result.success
             if (!result.success) tokenStore.clear()
+            if (openPanelRequested) openPanel()
         }
     }
 
@@ -482,16 +517,17 @@ class OverlayService : Service() {
         // Cấp quyền chỉ chuẩn bị phiên chụp. Không tự chụp hoặc dịch màn hình
         // đang hiển thị sau khi người dùng vừa xác nhận với Android.
         stopWaitingAnimation()
-        bubble.alpha = 1f
-        toast("Đã sẵn sàng. Nhấn B để bắt đầu dịch.")
-        scheduleFade()
+        bubble.visibility = View.GONE
+        closePanel()
+        if (authenticated) showControlPanel()
+        toast("Đã kích hoạt chia sẻ màn hình.")
     }
 
     private fun ensureCapture(): Boolean {
         if (captureController != null) return true
         stopWaitingAnimation()
         startActivity(Intent(this, MainActivity::class.java).setAction(MainActivity.ACTION_REQUEST_CAPTURE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        toast("Cho phép chụp màn hình để bắt đầu dịch.")
+        toast("Kích hoạt chia sẻ màn hình để bắt đầu dịch.")
         return false
     }
 
@@ -512,7 +548,7 @@ class OverlayService : Service() {
                 renderTranslations(result)
             } catch (_: TimeoutCancellationException) {
                 // Sau khi tắt màn hình lâu, MediaProjection đôi khi không báo onStop
-                // nhưng cũng không cấp ảnh mới. Khi đó nút B phải biến mất thay vì
+                // nhưng cũng không cấp ảnh mới. Khi đó nút BOI phải biến mất thay vì
                 // mắc kẹt ở dấu ba chấm.
                 stopBecauseCaptureDisconnected()
             } catch (error: Exception) {
@@ -529,23 +565,9 @@ class OverlayService : Service() {
     private fun stopBecauseCaptureDisconnected() {
         if (!::bubble.isInitialized) return
         stopWaitingAnimation(showB = false)
-        continuous = false
-        continuousJob?.cancel()
-        continuousJob = null
         captureController?.close()
         captureController = null
         stopSelf()
-    }
-
-    private fun startContinuous() {
-        if (!ensureCapture()) return
-        continuousJob?.cancel()
-        continuousJob = serviceScope.launch {
-            while (isActive && continuous) {
-                translateOnce()
-                delay(1_400)
-            }
-        }
     }
 
     private fun renderTranslations(paragraphs: List<TranslatedParagraph>) {
@@ -605,6 +627,15 @@ class OverlayService : Service() {
 
         private fun drawParagraph(canvas: Canvas, paragraph: TranslatedParagraph) {
             val box = Rect(paragraph.box)
+            if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                box.offset(LANDSCAPE_TRANSLATION_OFFSET_X_PX, 0)
+            } else {
+                box.offset(0, -PORTRAIT_TRANSLATION_OFFSET_Y_PX)
+            }
+            box.left = max(0, box.left)
+            box.top = max(0, box.top)
+            box.right = min(width, max(box.left + 1, box.right))
+            box.bottom = min(height, max(box.top + 1, box.bottom))
             val availableWidth = max(1, box.width())
             textPaint.color = paragraph.textColor
             textPaint.textSize = paragraph.textSizePx
@@ -675,7 +706,7 @@ class OverlayService : Service() {
     }
 
     private fun exitButton() = Button(this).apply {
-        text = "Tắt B"
+        text = "Tắt BOI"
         setTextColor(Color.WHITE)
         background = rounded(Color.rgb(190, 35, 46), dp(10).toFloat())
         setOnClickListener { stopSelf() }
@@ -721,6 +752,7 @@ class OverlayService : Service() {
 
     companion object {
         const val ACTION_SHOW = "com.dangtuan.btranslate.SHOW"
+        const val ACTION_OPEN_PANEL = "com.dangtuan.btranslate.OPEN_PANEL"
         const val ACTION_STOP = "com.dangtuan.btranslate.STOP"
         const val ACTION_START_CAPTURE = "com.dangtuan.btranslate.START_CAPTURE"
         const val EXTRA_RESULT_CODE = "result_code"
@@ -728,6 +760,8 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "b_overlay"
         private const val NOTIFICATION_ID = 1001
         private const val CAPTURE_TIMEOUT_MS = 5_000L
+        private const val LANDSCAPE_TRANSLATION_OFFSET_X_PX = 60
+        private const val PORTRAIT_TRANSLATION_OFFSET_Y_PX = 30
         private val FADE_TOKEN = Any()
         private val DOT_POSITIONS = intArrayOf(0, 2, 4)
         private val WAITING_DOT_LIFTS = arrayOf(

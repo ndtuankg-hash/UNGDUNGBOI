@@ -51,7 +51,7 @@ class MainActivity : AppCompatActivity() {
             finish()
         } else {
             captureRequested = false
-            status.text = "Bạn cần cho phép chụp màn hình để dịch chữ."
+            status.text = "Bạn cần cho phép chia sẻ màn hình để dịch chữ."
         }
     }
 
@@ -87,10 +87,9 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         if (!Settings.canDrawOverlays(this)) {
-            status.text = "Nhấn “Cho phép nút B nổi” để cấp quyền hiển thị trên ứng dụng khác."
+            status.text = "Nhấn “Cho phép nút BOI nổi” để cấp quyền hiển thị trên ứng dụng khác."
             return
         }
-        ContextCompat.startForegroundService(this, Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_SHOW))
         if (updateRequested) {
             continueUpdateIfReady()
             return
@@ -100,7 +99,8 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Khi đã có quyền, mở ứng dụng là hiện nút B ngay và không cần hiện bảng điều khiển.
+        // Khi đã có quyền phủ màn hình, mở thẳng bảng điều khiển BOI.
+        ContextCompat.startForegroundService(this, Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_OPEN_PANEL))
         if (!notificationPermissionPending) finish()
     }
 
@@ -118,7 +118,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!packageManager.canRequestPackageInstalls()) {
-            status.text = "Hãy bật “Cho phép từ nguồn này”, rồi quay lại B Dịch."
+            status.text = "Hãy bật “Cho phép từ nguồn này”, rồi quay lại BOI Dịch."
             if (!installPermissionOpened) {
                 installPermissionOpened = true
                 startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
@@ -130,7 +130,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun downloadAndInstallUpdate() {
         updateDownloadStarted = true
-        status.text = "Đang tải B Dịch $updateVersion…"
+        status.text = "Đang tải BOI Dịch $updateVersion…"
         lifecycleScope.launch {
             try {
                 val apk = withContext(Dispatchers.IO) { downloadUpdateApk() }
@@ -149,7 +149,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun downloadUpdateApk(): File {
         val directory = File(getExternalFilesDir(null), "updates").apply { mkdirs() }
-        val output = File(directory, "B-Dich-Android-$updateVersion.apk")
+        val output = File(directory, "BOI-Dich-Android-$updateVersion.apk")
         val connection = (URL(updateUrl).openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000
             readTimeout = 60_000
@@ -195,10 +195,10 @@ class MainActivity : AppCompatActivity() {
         val padding = (24 * resources.displayMetrics.density).toInt()
         status = TextView(this).apply {
             textSize = 18f
-            text = "Đang chuẩn bị nút B…"
+            text = "Đang chuẩn bị BOI…"
         }
         val permission = Button(this).apply {
-            text = "Cho phép nút B nổi"
+            text = "Cho phép nút BOI nổi"
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
             }
@@ -208,9 +208,9 @@ class MainActivity : AppCompatActivity() {
             setPadding(padding, padding * 2, padding, padding)
             addView(ImageView(this@MainActivity).apply {
                 setImageResource(com.dangtuan.btranslate.R.mipmap.ic_launcher)
-                contentDescription = "Avatar B Dịch"
+                contentDescription = "Avatar BOI Dịch"
             }, LinearLayout.LayoutParams(padding * 4, padding * 4))
-            addView(TextView(this@MainActivity).apply { text = "B Dịch"; textSize = 30f })
+            addView(TextView(this@MainActivity).apply { text = "BOI Dịch"; textSize = 30f })
             addView(status, LinearLayout.LayoutParams(-1, -2).apply { topMargin = padding })
             addView(permission, LinearLayout.LayoutParams(-1, -2).apply { topMargin = padding })
         })
