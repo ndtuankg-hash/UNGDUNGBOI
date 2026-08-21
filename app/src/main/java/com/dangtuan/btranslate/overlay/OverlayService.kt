@@ -628,9 +628,9 @@ class OverlayService : Service() {
         private fun drawParagraph(canvas: Canvas, paragraph: TranslatedParagraph) {
             val box = Rect(paragraph.box)
             if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
-                box.offset(-TRANSLATION_OFFSET_PX, 0)
+                box.offset(LANDSCAPE_TRANSLATION_OFFSET_X_PX, 0)
             } else {
-                box.offset(0, -TRANSLATION_OFFSET_PX)
+                box.offset(0, -PORTRAIT_TRANSLATION_OFFSET_Y_PX)
             }
             box.left = max(0, box.left)
             box.top = max(0, box.top)
@@ -760,7 +760,8 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "b_overlay"
         private const val NOTIFICATION_ID = 1001
         private const val CAPTURE_TIMEOUT_MS = 5_000L
-        private const val TRANSLATION_OFFSET_PX = 100
+        private const val LANDSCAPE_TRANSLATION_OFFSET_X_PX = 60
+        private const val PORTRAIT_TRANSLATION_OFFSET_Y_PX = 30
         private val FADE_TOKEN = Any()
         private val DOT_POSITIONS = intArrayOf(0, 2, 4)
         private val WAITING_DOT_LIFTS = arrayOf(
