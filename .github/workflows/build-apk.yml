@@ -33,15 +33,7 @@ jobs:
 
       - name: Kiem tra bien dich tren pull request
         if: github.event_name == 'pull_request'
-        run: ./gradlew --no-daemon assembleRelease
-
-      - name: Luu APK chua ky de kiem tra
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: BOI-Dich-Android-v0.1.8-unsigned
-          path: app/build/outputs/apk/release/app-release-unsigned.apk
-          if-no-files-found: error
+        run: ./gradlew --no-daemon assembleDebug
 
       - name: Tao APK cai truc tiep
         if: github.event_name != 'pull_request'
